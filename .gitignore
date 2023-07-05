@@ -1,0 +1,4 @@
+os.elf
+app.bin
+target/*
+Cargo.lock
