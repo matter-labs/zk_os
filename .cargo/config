@@ -1,0 +1,12 @@
+[build]
+target = "riscv32i-unknown-none-elf"
+rustflags = [
+    "-C", "target-feature=+m,+unaligned-scalar-mem,+relax",
+    "-C", "link-arg=-Tsrc/lds/memory.x",
+    "-C", "link-arg=-Tsrc/lds/link.x",
+]
+
+[target.riscv32i-unknown-none-elf]
+runner = "../../risc_v_simulator/cargo run --bin runner "
+
+
