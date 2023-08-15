@@ -7,18 +7,29 @@ use crate::utils::*;
 use riscv::register::{mstatus::MPP, satp::Mode};
 
 #[inline(never)]
-fn handle_unaligned_load(
+fn machine_mode_handle_unaligned_load(
     trap_frame: &mut MachineTrapFrame,
     instr: u32,
     epc: usize,
 ) -> (usize, bool) {
-    // Below you will find an example how it should be possible to trap
-    // and handle unaligned memory access. We actually no longer need this functionality,
-    // so we put WFT here
+    // Simulator and circuit disable unaligned loads (but still can load individual u8/u16/u32 without crossing memory boundary),
+    // so we should only expect cases when we cross the boudnary
 
-    unsafe { riscv::asm::wfi() };
+    let rd = get_rd(instr);
+    if rd == 0 {
+        unsafe { riscv::asm::wfi() };
+    }
 
     // now depending on how many bytes we need to load we proceed
+    let mut imm = ITypeOpcode::imm(instr);
+    sign_extend(&mut imm, 12);
+    let rs1 = ITypeOpcode::rs1(instr);
+    let rs1: u32 = trap_frame.registers[rs1 as usize];
+    let physical_address = rs1.wrapping_add(imm);
+
+    let aligned_address = physical_address & !3;
+    let unalignment = physical_address & 3;
+
     let funct3 = ITypeOpcode::funct3(instr);
 
     let bytes_to_read = match funct3 {
@@ -28,40 +39,48 @@ fn handle_unaligned_load(
         _ => return (0, true), // invalid instruction
     };
 
-    let rd = get_rd(instr);
-    let mut imm = ITypeOpcode::imm(instr);
-    sign_extend(&mut imm, 12);
-    let rs1 = ITypeOpcode::rs1(instr);
-    let rs1: u32 = trap_frame.registers[rs1 as usize];
+    // now just match over everything
+
     // no translation here
-    let physical_address = rs1.wrapping_add(imm) as usize;
-    let unalignement = physical_address & 0x3;
-    let aligned_address = core::ptr::from_exposed_addr::<u32>(physical_address & !0x3);
+    let value: u32 = match (unalignment, bytes_to_read) {
+        (1, 2) => {
+            // single write
+            let value_low =
+                unsafe { core::ptr::from_exposed_addr::<u32>(aligned_address as usize).read() };
 
-    let unalignment_bits = unalignement * 8;
-    let value: u32 = match (unalignement, bytes_to_read) {
-        (1, 2) | (2, 2) | (1, 1) | (2, 1) | (3, 1) => {
-            let value_low = unsafe { aligned_address.read() };
-
-            value_low >> unalignment_bits
+            value_low >> 8
         }
-        (3, 2) | (1, 4) | (2, 4) | (3, 4) => {
-            let value_low = unsafe { aligned_address.read() };
-            let value_high = unsafe { aligned_address.add(1).read() };
-            // properly shift to get value
+        (1, 4) | (2, 4) | (3, 4) | (3, 2) => {
+            let (next_address, overflow) = aligned_address.overflowing_add(4);
+            if overflow {
+                unsafe { riscv::asm::wfi() };
+            }
 
-            (value_low >> unalignment_bits) | (value_high << (32 - unalignment_bits))
+            let value_low =
+                unsafe { core::ptr::from_exposed_addr::<u32>(aligned_address as usize).read() };
+            let value_high =
+                unsafe { core::ptr::from_exposed_addr::<u32>(next_address as usize).read() };
+            // properly shift to get value. Sign/zero extend below takes care of cleaning up top bytes if needed
+            let shift = unalignment * 8;
+
+            (value_low >> shift) | (value_high << (32 - shift))
         }
-        _ => unsafe { unreachable_unchecked() },
+        _ => unsafe {
+            riscv::asm::wfi();
+
+            unreachable_unchecked()
+        },
     };
 
     let ret_val = match funct3 {
-        0 => sign_extend_8(value),
         1 => sign_extend_16(value),
         2 => value,
-        4 => zero_extend_8(value),
         5 => zero_extend_16(value),
-        _ => unsafe { unreachable_unchecked() },
+        _ => unsafe {
+            riscv::asm::wfi();
+
+            unreachable_unchecked()
+        },
     };
 
     trap_frame.registers[rd as usize] = ret_val;
@@ -71,16 +90,19 @@ fn handle_unaligned_load(
 }
 
 #[inline(never)]
-fn handle_unaligned_store(
+fn machine_mode_handle_unaligned_store(
     trap_frame: &mut MachineTrapFrame,
     instr: u32,
     epc: usize,
 ) -> (usize, bool) {
-    // Below you will find an example how it should be possible to trap
-    // and handle unaligned memory access. We actually no longer need this functionality,
-    // so we put WFT here
+    // Same - we only handle u16/u32 unaligned stores
 
-    unsafe { riscv::asm::wfi() };
+    let mut imm = STypeOpcode::imm(instr);
+    sign_extend(&mut imm, 12);
+
+    let rs1 = STypeOpcode::rs1(instr);
+    let rs1: u32 = trap_frame.registers[rs1 as usize];
+    let physical_address = rs1.wrapping_add(imm);
 
     let funct3 = STypeOpcode::funct3(instr);
     let bytes_to_write = match funct3 {
@@ -88,44 +110,66 @@ fn handle_unaligned_store(
         _ => return (0, true), // invalid instruction
     };
 
-    let mut imm = STypeOpcode::imm(instr);
-    sign_extend(&mut imm, 12);
-
-    let rs1 = STypeOpcode::rs1(instr);
-    let rs1: u32 = trap_frame.registers[rs1 as usize];
-    let physical_address = rs1.wrapping_add(imm) as usize;
-
-    let unalignement = physical_address & 0x3;
-    let aligned_address = core::ptr::from_exposed_addr_mut::<u32>(physical_address & !0x3);
+    let aligned_address = physical_address & !3;
+    let unalignment = physical_address & 3;
 
     let rs2 = STypeOpcode::rs2(instr);
     let rs2: u32 = trap_frame.registers[rs2 as usize];
     let value_to_write = rs2;
 
-    let unalignment_bits = unalignement * 8;
-    match (unalignement, bytes_to_write) {
-        (1, 2) | (2, 2) | (1, 1) | (2, 1) | (3, 1) => {
-            // we only need 1 access
-            let existing_value_low = unsafe { aligned_address.read() };
-            let mask_for_existing_low = (1 << unalignment_bits) - 1;
-            let new_low =
-                (existing_value_low & mask_for_existing_low) | (value_to_write << unalignment_bits);
-            unsafe { aligned_address.write(new_low) };
+    match (unalignment, bytes_to_write) {
+        (1, 2) => {
+            // single read and write
+            let existing_value_low =
+                unsafe { core::ptr::from_exposed_addr::<u32>(aligned_address as usize).read() };
+            let new_value = existing_value_low & 0xff0000ff & ((value_to_write & 0x0000ffff) << 8);
+            unsafe {
+                core::ptr::from_exposed_addr_mut::<u32>(aligned_address as usize).write(new_value)
+            };
         }
-        (3, 2) | (1, 4) | (2, 4) | (3, 4) => {
-            let existing_value_low = unsafe { aligned_address.read() };
-            let existing_value_high = unsafe { aligned_address.add(1).read() };
-            // properly shift to get value
-            let mask_for_existing_low = (1 << unalignment_bits) - 1;
-            let new_low =
-                (existing_value_low & mask_for_existing_low) | (value_to_write << unalignment_bits);
-            let mask_for_existing_high = !mask_for_existing_low;
-            let new_high = (existing_value_high & mask_for_existing_high)
-                | (value_to_write >> (32 - unalignment_bits));
-            unsafe { aligned_address.write(new_low) };
-            unsafe { aligned_address.add(1).write(new_high) };
+        (1, 4) | (2, 4) | (3, 4) | (3, 2) => {
+            let (next_address, overflow) = aligned_address.overflowing_add(4);
+            if overflow {
+                unsafe { riscv::asm::wfi() };
+            }
+
+            let existing_value_low =
+                unsafe { core::ptr::from_exposed_addr::<u32>(aligned_address as usize).read() };
+            let existing_value_high =
+                unsafe { core::ptr::from_exposed_addr::<u32>(next_address as usize).read() };
+
+            let value_mask = match bytes_to_write {
+                2 => 0x0000ffffu32,
+                4 => 0xffffffffu32,
+                _ => unsafe { unreachable_unchecked() },
+            };
+            let masked_value = value_to_write & value_mask;
+
+            let (mask_existing_low, mask_existing_high) = match (unalignment, bytes_to_write) {
+                (1, 4) => (0x000000ffu32, 0xffffff00u32),
+                (2, 4) => (0x0000ffffu32, 0xffff0000u32),
+                (3, 4) => (0x00ffffffu32, 0xff000000u32),
+                (3, 2) => (0x00ffffffu32, 0xffffff00u32),
+                _ => unsafe { unreachable_unchecked() },
+            };
+
+            let shift = unalignment * 8;
+            let new_low = (existing_value_low & mask_existing_low) | (masked_value << shift);
+            let new_high =
+                (existing_value_high & mask_existing_high) | (masked_value >> (32 - shift));
+
+            unsafe {
+                core::ptr::from_exposed_addr_mut::<u32>(aligned_address as usize).write(new_low)
+            };
+            unsafe {
+                core::ptr::from_exposed_addr_mut::<u32>(next_address as usize).write(new_high)
+            };
         }
-        _ => unsafe { unreachable_unchecked() },
+        _ => unsafe {
+            riscv::asm::wfi();
+
+            unreachable_unchecked()
+        },
     };
 
     // return to mepc + 4
@@ -146,14 +190,20 @@ fn custom_machine_exception_handler(trap_frame: &mut MachineTrapFrame) -> usize 
     match cause_num {
         0 | 4 | 6 => {
             if previous_mode == MPP::Machine || satp.mode() == Mode::Bare {
-                // we do not need a translation
-                let mepc = core::ptr::from_exposed_addr::<u32>(epc);
-                let instr = unsafe { mepc.read() };
+                // we do not need a translation, but we also have an opcode value in the TVAL
+                let instr = riscv::register::mtval::read();
+                let instr = instr as u32;
+
+                //// we can also do by dereference
+                // let mepc = core::ptr::from_exposed_addr::<u32>(epc);
+                // let instr = unsafe { mepc.read() };
+
                 let opcode = get_opcode(instr);
+
                 if opcode == 0b0000011 {
                     // LOAD
                     let (new_pc, invalid_instruction) =
-                        handle_unaligned_load(trap_frame, instr, epc);
+                        machine_mode_handle_unaligned_load(trap_frame, instr, epc);
                     if invalid_instruction {
                         unsafe { riscv::asm::wfi() }
                     } else {
@@ -162,7 +212,7 @@ fn custom_machine_exception_handler(trap_frame: &mut MachineTrapFrame) -> usize 
                 } else if opcode == 0b0100011 {
                     // STORE
                     let (new_pc, invalid_instruction) =
-                        handle_unaligned_store(trap_frame, instr, epc);
+                        machine_mode_handle_unaligned_store(trap_frame, instr, epc);
                     if invalid_instruction {
                         unsafe { riscv::asm::wfi() }
                     } else {
@@ -179,61 +229,5 @@ fn custom_machine_exception_handler(trap_frame: &mut MachineTrapFrame) -> usize 
         _ => {}
     }
 
-    let tval = riscv::register::mtval::read();
-    let hart = riscv::register::mhartid::read();
-
     crate::rust_abort();
-
-    // use crate::println;
-
-    // // The cause contains the type of trap (sync, async) as well as the cause
-    // // number. So, here we narrow down just the cause number.
-    // let cause_num = cause & 0xfff;
-    // let mut return_pc = epc;
-    // match cause_num {
-    //     2 => unsafe {
-    //         // Illegal instruction
-    //         // println!("Illegal instruction CPU#{} -> 0x{:08x}: 0x{:08x}\n", hart, epc, tval);
-
-    //         crate::rust_abort();
-
-    //         // delete_process((*frame).pid as u16);
-    //         // let frame = schedule();
-    //         // schedule_next_context_switch(1);
-    //         // rust_switch_to_user(frame);
-    //     },
-    //     3 => {
-    //         // breakpoint
-    //         // println!("BKPT\n\n");
-    //         return_pc += 4;
-    //     },
-    //     // 7 => unsafe {
-    //     // 	println!("Error with pid {}, at PC 0x{:08x}, mepc 0x{:08x}", (*frame).pid, (*frame).pc, epc);
-    //     // },
-    //     8 | 9 | 11 => unsafe {
-    //         crate::rust_abort();
-    //     },
-    //     // Page faults
-    //     12 => unsafe {
-    //         // Instruction page fault
-    //         // println!("Instruction page fault CPU#{} -> 0x{:08x}: 0x{:08x}", hart, epc, tval);
-    //     },
-    //     13 => unsafe {
-    //         // Load page fault
-    //         // println!("Load page fault CPU#{} -> 0x{:08x}: 0x{:08x}", hart, epc, tval);
-    //     },
-    //     15 => unsafe {
-    //         // Store page fault
-    //         // println!("Store page fault CPU#{} -> 0x{:08x}: 0x{:08x}", hart, epc, tval);
-    //     },
-    //     _ => {
-    //         // panic!(
-    //         //         "Unhandled sync trap {}. CPU#{} -> 0x{:08x}: 0x{:08x}\n",
-    //         //         cause_num, hart, epc, tval
-    //         // );
-    //     }
-    // };
-    //
-    // // Finally, return the updated program counter
-    // return_pc
 }

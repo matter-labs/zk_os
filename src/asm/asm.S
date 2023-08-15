@@ -184,7 +184,9 @@ machine_default_start_trap:
     sw x3, -116(x31)
     sw x2, -120(x31)
     sw x1, -124(x31)
-    sw x0, -128(x31)
+    
+    // we will not restore it, so we are ok to avoid write
+    # sw x0, -128(x31)
 
     // move valid sp into a0,
     mv a0, x31
@@ -208,7 +210,10 @@ machine_default_start_trap:
     csrw mscratch, a0 // save it for now
 
     // restore everything we saved
-    lw x0, 0(sp)
+
+    // it's illegal instruction, so we skip. Anyway can not overwrite x0
+    # lw x0, 0(sp)
+
     lw x1, 4(sp)
     # lw x2, 8(sp) // do not overwrite SP yet
     lw x3, 12(sp)
