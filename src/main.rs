@@ -25,11 +25,10 @@ pub mod cpu;
 pub mod helper_reg_utils;
 pub mod machine_trap;
 pub mod quasi_uart;
-pub mod trap;
 pub mod trap_frame;
 pub mod utils;
 
-use riscv::register::{mcause as xcause, mtvec as xtvec, mtvec::TrapMode as xTrapMode};
+use riscv::register::mcause as xcause;
 use riscv_rt::__INTERRUPTS;
 
 use self::trap_frame::MachineTrapFrame;
@@ -63,7 +62,7 @@ macro_rules! println
 extern "C" fn eh_personality() {}
 
 #[panic_handler]
-fn panic(info: &core::panic::PanicInfo) -> ! {
+fn panic(_info: &core::panic::PanicInfo) -> ! {
     // print!("Aborting: ");
     // if let Some(p) = info.location() {
     // 	println!(
@@ -123,18 +122,42 @@ fn main() -> ! {
 
     // and test cross-word boundary unaligned load/store
 
-    let a = 42u32;
+    let a = 0x12345678u32;
 
     let b = unsafe {
-        let ptr = core::ptr::from_exposed_addr_mut::<u32>(0x07 as usize);
+        let ptr = core::ptr::from_exposed_addr_mut::<u32>(0x17 as usize);
         ptr.write_volatile(a);
         ptr.read_volatile()
     };
 
     if a == b {
-        let _ = pinger.write_str("Unaligned store/load is fine");
+        let _ = pinger.write_str("Unaligned u32 store/load is fine");
     } else {
-        let _ = pinger.write_str("Unaligned store/load is broken");
+        let _ = pinger.write_str("Unaligned u32 store/load is broken");
+        let low = unsafe { core::ptr::from_exposed_addr::<u32>(0x14 as usize).read_volatile() };
+        let high = unsafe { core::ptr::from_exposed_addr::<u32>(0x18 as usize).read_volatile() };
+        println!("Low = 0x{:08x}", low);
+        println!("High = 0x{:08x}", high);
+        println!("Expected 0x12345678, read 0x{:08x}", b);
+    }
+
+    let a = 0x1234u16;
+
+    let b = unsafe {
+        let ptr = core::ptr::from_exposed_addr_mut::<u16>(0x23 as usize);
+        ptr.write_volatile(a);
+        ptr.read_volatile()
+    };
+
+    if a == b {
+        let _ = pinger.write_str("Unaligned u16 store/load is fine");
+    } else {
+        let _ = pinger.write_str("Unaligned u16 store/load is broken");
+        let low = unsafe { core::ptr::from_exposed_addr::<u32>(0x20 as usize).read_volatile() };
+        let high = unsafe { core::ptr::from_exposed_addr::<u32>(0x24 as usize).read_volatile() };
+        println!("Low = 0x{:08x}", low);
+        println!("High = 0x{:08x}", high);
+        println!("Expected 0x1234, read 0x{:04x}", b);
     }
 
     loop {}
